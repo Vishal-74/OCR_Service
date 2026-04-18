@@ -1,0 +1,74 @@
+{
+  "name": "OCR Gate (drop-in, 3 nodes)",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// OCR Gate \u2014 Combine\n// The 'Merge' node in Mehta_Och AI is configured in append mode, so it emits\n// TWO items: the WhatsApp payload (has .messages) and the Google Sheet row\n// (has .row_number / .mode). This node does the same combine the Route code\n// does, and emits a SINGLE item so the HTTP Request below fires exactly once\n// per inbound WhatsApp message.\n\nconst items = $input.all();\nconst waItem    = items.find(it => it && it.json && it.json.messages);\nconst sheetItem = items.find(it => it && it.json && (it.json.row_number !== undefined || it.json.mode !== undefined));\n\nconst wa    = (waItem && waItem.json) || {};\nconst sheet = (sheetItem && sheetItem.json) || {};\n\n// Prefer sheet values only when they exist (don't clobber WA data with undefined).\nconst combined = { ...wa, ...sheet };\n\n// Normalise the mode field we hand the OCR service. We keep it as null if the\n// user has no persisted mode yet \u2014 the service treats that as 'start a new\n// OCR conversation with the default resume mode'.\nif (!combined.mode || typeof combined.mode !== 'string') combined.mode = null;\n\nreturn [{ json: combined }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1744, 176],
+      "id": "ocr-gate-combine",
+      "name": "OCR Gate \u2014 Combine"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OCR_SERVICE_BASE_URL }}/v1/whatsapp/ingest",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-internal-secret", "value": "={{ $env.OCR_SHARED_SECRET }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  metadata: $json.metadata || {},\n  messages: $json.messages || [],\n  contacts: $json.contacts || [],\n  mode: $json.mode || null\n}) }}",
+        "options": {
+          "timeout": 30000,
+          "response": { "response": { "neverError": true, "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-1584, 176],
+      "id": "ocr-gate-call-service",
+      "name": "OCR Gate \u2014 Call Service"
+    },
+    {
+      "parameters": {
+        "jsCode": "// OCR Gate \u2014 Apply Response\n// Inputs (from HTTP Request): index 0 = OCR service response JSON.\n// Upstream: the combined payload we want to forward to Route when not gated.\n//\n// Behaviour:\n//   handled=false              -> pass the combined payload through to Route.\n//   handled=true, done=false   -> emit nothing (stop this run;\n//                                 OCR already replied on WhatsApp).\n//   handled=true, done=true    -> rewrite messages[0] as plain text with\n//                                 injected_text and set mode to resume_mode,\n//                                 then continue to Route exactly like a\n//                                 normal user text message.\n\nconst gateItems = $input.all();\nconst gate = (gateItems[0] && gateItems[0].json) || {};\n\n// Get the combined payload produced by 'OCR Gate \u2014 Combine'.\nlet combinedItems = [];\ntry { combinedItems = $items('OCR Gate \u2014 Combine'); } catch (_) { combinedItems = []; }\nconst combined = (combinedItems[0] && combinedItems[0].json) || {};\n\n// 1) Not handled -> pass the combined payload through.\nif (!gate || gate.handled !== true) {\n  return [{ json: combined }];\n}\n\n// 2) Handled but not done -> stop.\nif (gate.done !== true) {\n  return [];\n}\n\n// 3) Handled and done -> inject the confirmed list as a user text message.\nconst injected = String(gate.injected_text || '').trim();\nif (!injected) {\n  return [{ json: combined }];\n}\n\nconst cloned = JSON.parse(JSON.stringify(combined || {}));\ncloned.messages = Array.isArray(cloned.messages) ? cloned.messages : [];\nconst msg = cloned.messages[0] || {};\nmsg.type = 'text';\nmsg.text = { body: injected };\ndelete msg.image;\ndelete msg.audio;\ndelete msg.voice;\ndelete msg.interactive;\ndelete msg.button;\ncloned.messages[0] = msg;\n\n// Carry back the mode the user was in so Route's 'continue in mode' branch\n// fires (order / service / appointment / call_agent).\nif (gate.resume_mode) cloned.mode = gate.resume_mode;\n\ncloned._ocr = {\n  injected: true,\n  resume_mode: gate.resume_mode || null,\n  at: new Date().toISOString()\n};\n\nreturn [{ json: cloned }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1424, 176],
+      "id": "ocr-gate-apply-response",
+      "name": "OCR Gate \u2014 Apply Response"
+    }
+  ],
+  "connections": {
+    "OCR Gate \u2014 Combine": {
+      "main": [
+        [
+          {
+            "node": "OCR Gate \u2014 Call Service",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OCR Gate \u2014 Call Service": {
+      "main": [
+        [
+          {
+            "node": "OCR Gate \u2014 Apply Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

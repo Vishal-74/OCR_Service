@@ -207,19 +207,39 @@ def _session_expired(session: dict) -> bool:
 # Meta Graph API — media download + WA sends
 # ---------------------------------------------------------------------------
 
-def _download_meta_media(media_id: str, access_token: str) -> tuple[bytes, str]:
+def _download_meta_media(
+    media_id: str,
+    access_token: str,
+    phone_number_id: Optional[str] = None,
+) -> tuple[bytes, str]:
     """Meta's two-step media download.
 
-    1) GET /<version>/<media_id>            -> { url, mime_type, ... }
-    2) GET <url>  (Authorization: Bearer)   -> raw bytes
+    1) GET /<version>/<media_id>?phone_number_id=<pni>   -> { url, mime_type, ... }
+    2) GET <url>  (Authorization: Bearer)                -> raw bytes
+
+    Including `phone_number_id` is Meta's documented best practice for Graph
+    v17+ — it helps the API scope the token check to the right number and
+    avoids 400s when a business has multiple numbers under one WABA.
     """
     meta_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{media_id}"
+    params = {"phone_number_id": phone_number_id} if phone_number_id else None
     r1 = requests.get(
         meta_url,
+        params=params,
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=20,
     )
-    r1.raise_for_status()
+    if not r1.ok:
+        # Surface the actual Meta error so we can see *why* (expired token,
+        # wrong WABA, unknown media, rate limit, etc.) in the Railway logs.
+        log.error(
+            "Meta media lookup failed: status=%s media_id=%s pni=%s body=%s",
+            r1.status_code,
+            media_id,
+            phone_number_id,
+            r1.text[:600],
+        )
+        r1.raise_for_status()
     meta = r1.json()
     url = meta.get("url")
     mime = meta.get("mime_type") or "application/octet-stream"
@@ -231,7 +251,13 @@ def _download_meta_media(media_id: str, access_token: str) -> tuple[bytes, str]:
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=30,
     )
-    r2.raise_for_status()
+    if not r2.ok:
+        log.error(
+            "Meta media bytes fetch failed: status=%s body=%s",
+            r2.status_code,
+            r2.text[:600],
+        )
+        r2.raise_for_status()
     return r2.content, mime
 
 
@@ -279,9 +305,12 @@ def _parse_items_json(raw: str) -> list[dict]:
     try:
         data = json.loads(_strip_code_fence(raw))
     except json.JSONDecodeError:
-        log.warning("LLM returned non-JSON: %s", raw[:200])
+        log.warning("LLM returned non-JSON (first 400 chars): %s", raw[:400])
         return []
     if not isinstance(data, list):
+        log.warning(
+            "LLM returned non-array (first 400 chars): %s", str(data)[:400]
+        )
         return []
     out: list[dict] = []
     for item in data:
@@ -291,6 +320,8 @@ def _parse_items_json(raw: str) -> list[dict]:
         qty = str(item.get("quantity") or "").strip()
         if name:
             out.append({"name": name, "quantity": qty})
+    if not out:
+        log.info("LLM returned empty items list; raw=%s", raw[:400])
     return out
 
 
@@ -329,16 +360,28 @@ def _transcribe_audio(audio_bytes: bytes, mime: str) -> str:
     t = openai_client.audio.transcriptions.create(
         model=OPENAI_WHISPER_MODEL, file=buf
     )
-    return (t.text or "").strip()
+    text = (t.text or "").strip()
+    log.info("Whisper transcript (%s, %dB): %r", ext, len(audio_bytes), text[:400])
+    return text
 
 
 def _text_to_items(text: str) -> list[dict]:
     prompt = (
-        "Extract every shopping / grocery item from the following text. "
-        "Return ONLY a JSON array, no markdown, no explanation.\n"
-        'Each element: {"name": "...", "quantity": "..."}. '
-        "If the quantity is unclear or missing, use an empty string.\n\n"
-        f"Text:\n{text}"
+        "You convert a customer's free-form message (often a voice-note "
+        "transcription) into a structured shopping list. The message can be "
+        "in any language; translate item names to English if obvious.\n\n"
+        "Instructions:\n"
+        "1. Ignore greetings, politeness, filler (\"I need\", \"please send\", "
+        "   \"bhaiya\", \"also\", \"and\", \"okay\", \"bye\", etc.).\n"
+        "2. Extract every product the user wants. Be generous — if the user "
+        "   mentions a grocery / household / store item by name, include it.\n"
+        "3. Quantity can be weight (500g, 1kg), volume (1L), count (2, 3 packs), "
+        "   or empty string if unclear.\n"
+        "4. Return ONLY a JSON array, no markdown, no explanation, no prose.\n"
+        '   Format: [{"name": "Milk", "quantity": "1L"}, '
+        '{"name": "Bread", "quantity": ""}]\n'
+        "5. If truly nothing was asked for, return [].\n\n"
+        f"Message:\n{text}"
     )
     resp = openai_client.chat.completions.create(
         model=OPENAI_TEXT_MODEL,
@@ -346,7 +389,10 @@ def _text_to_items(text: str) -> list[dict]:
         max_tokens=800,
         temperature=0,
     )
-    return _parse_items_json(resp.choices[0].message.content or "")
+    raw = resp.choices[0].message.content or ""
+    items = _parse_items_json(raw)
+    log.info("text_to_items: text=%r -> %d items", text[:200], len(items))
+    return items
 
 
 def _apply_edits(items: list[dict], edit_text: str) -> list[dict]:
@@ -539,7 +585,9 @@ def ingest():
                     200,
                 )
 
-            raw_bytes, mime = _download_meta_media(media_id, access_token)
+            raw_bytes, mime = _download_meta_media(
+                media_id, access_token, phone_number_id=phone_number_id
+            )
 
             if message_type == "image":
                 items = _ocr_image_to_items(raw_bytes, mime)

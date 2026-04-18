@@ -228,7 +228,7 @@ def app_module(monkeypatch, fake_supabase, fake_openai):
             {"phone_number_id": phone_number_id, "to": to, "body": body}
         )
 
-    def _fake_download_media(media_id, access_token):
+    def _fake_download_media(media_id, access_token, phone_number_id=None):
         return b"\x00\x00", "image/jpeg"
 
     monkeypatch.setattr(_app, "_send_wa_text", _fake_send_wa_text)
