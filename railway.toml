@@ -5,9 +5,10 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# No startCommand here — the Dockerfile's CMD handles start-up via `sh -c`
-# so $PORT gets properly expanded. Setting startCommand here bypasses the
-# shell and Railway passes "$PORT" to gunicorn as a literal string.
+# Bind to 8080 literally — do NOT use $PORT here. Railway invokes this
+# without a shell, so $PORT is passed through to gunicorn as the string "$PORT"
+# and crashes. The Dockerfile CMD also uses 8080; Railway detects the port.
+startCommand = "gunicorn app:app --bind 0.0.0.0:8080 --workers 2 --threads 4 --timeout 60"
 healthcheckPath = "/health"
 healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
