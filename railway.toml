@@ -1,5 +1,8 @@
 [build]
-builder = "NIXPACKS"
+# Use the Dockerfile if present (bulletproof against Railpack / Nixpacks
+# detector regressions). Falls back to Nixpacks when Dockerfile is missing.
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60"
