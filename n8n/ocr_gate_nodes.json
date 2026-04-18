@@ -1,0 +1,53 @@
+{
+  "name": "OCR Gate (drop-in)",
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OCR_SERVICE_BASE_URL }}/v1/whatsapp/ingest",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-internal-secret", "value": "={{ $env.OCR_SHARED_SECRET }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  metadata: $json.metadata || {},\n  messages: $json.messages || [],\n  contacts: $json.contacts || [],\n  mode: $json.mode || null\n}) }}",
+        "options": {
+          "timeout": 30000,
+          "response": { "response": { "neverError": true, "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-1600, 176],
+      "id": "ocr-gate-call-service",
+      "name": "OCR Gate \u2014 Call Service"
+    },
+    {
+      "parameters": {
+        "jsCode": "// OCR Gate \u2014 Apply Response\n// Inputs (via $input.all()):\n//   index 0: the OCR service response (HTTP Request node output)\n// Inputs (via $items('Merge')):\n//   the original merged payload we want to forward to Route.\n//\n// Behaviour:\n//   handled=false              -> pass original payload through untouched\n//   handled=true, done=false   -> emit nothing (stop the run; OCR already replied)\n//   handled=true, done=true    -> rewrite messages[0] as plain text with injected_text,\n//                                 set mode to resume_mode, then continue to Route.\n\nconst gateItems = $input.all();\nconst gate = (gateItems[0] && gateItems[0].json) || {};\n\n// Get the original payload we need to forward to Route.\n// Prefer the last 'Merge' output; fall back to the gate item if present.\nlet originalItems = [];\ntry {\n  originalItems = $items('Merge');\n} catch (_) {\n  originalItems = [];\n}\nconst original = (originalItems[0] && originalItems[0].json)\n  || (gateItems[0] && gateItems[0].json && gateItems[0].json.__original)\n  || {};\n\n// 1) Not handled -> pass through.\nif (!gate || gate.handled !== true) {\n  return [{ json: original }];\n}\n\n// 2) Handled but not done -> stop.\nif (gate.done !== true) {\n  return [];\n}\n\n// 3) Handled and done -> inject the confirmed list as a user text message.\nconst injected = String(gate.injected_text || '').trim();\nif (!injected) {\n  // Defensive: if the service marked done without text, just pass through.\n  return [{ json: original }];\n}\n\nconst cloned = JSON.parse(JSON.stringify(original || {}));\ncloned.messages = Array.isArray(cloned.messages) ? cloned.messages : [];\nconst msg = cloned.messages[0] || {};\nmsg.type = 'text';\nmsg.text = { body: injected };\ndelete msg.image;\ndelete msg.audio;\ndelete msg.voice;\ndelete msg.interactive;\ndelete msg.button;\ncloned.messages[0] = msg;\n\n// Carry back the mode the user was in, so Route's 'already in mode' branch fires.\nif (gate.resume_mode) {\n  cloned.mode = gate.resume_mode;\n}\n\n// Mark so downstream can detect an OCR-injected message if ever needed.\ncloned._ocr = {\n  injected: true,\n  resume_mode: gate.resume_mode || null,\n  at: new Date().toISOString()\n};\n\nreturn [{ json: cloned }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1456, 176],
+      "id": "ocr-gate-apply-response",
+      "name": "OCR Gate \u2014 Apply Response"
+    }
+  ],
+  "connections": {
+    "OCR Gate \u2014 Call Service": {
+      "main": [
+        [
+          {
+            "node": "OCR Gate \u2014 Apply Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
