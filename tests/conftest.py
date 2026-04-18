@@ -163,13 +163,19 @@ class _FakeCompletion:
 class _FakeChatCompletions:
     def __init__(self):
         self.next_content: str = "[]"
+        # If set, each create() pops the next string (for multi-step vision flows).
+        self.queue: list[str] = []
         self.last_messages = None
         self.call_count = 0
 
     def create(self, *, model, messages, **_kwargs):
         self.call_count += 1
         self.last_messages = messages
-        return _FakeCompletion(self.next_content)
+        if self.queue:
+            content = self.queue.pop(0)
+        else:
+            content = self.next_content
+        return _FakeCompletion(content)
 
 
 class _FakeAudio:

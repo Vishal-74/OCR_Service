@@ -23,6 +23,21 @@ def _image_msg(phone="+15550001111", msg_id="wamid.IMG1", pni="PNI-123"):
     }
 
 
+def _audio_msg(phone="+15550001111", msg_id="wamid.AUD1", pni="PNI-123"):
+    return {
+        "metadata": {"phone_number_id": pni},
+        "messages": [
+            {
+                "from": phone,
+                "id": msg_id,
+                "type": "audio",
+                "audio": {"id": "MEDIA-A", "mime_type": "audio/ogg"},
+            }
+        ],
+        "mode": "appointment",
+    }
+
+
 def _text_msg(text, phone="+15550001111", msg_id="wamid.T1", pni="PNI-123", mode="order"):
     return {
         "metadata": {"phone_number_id": pni},
@@ -114,17 +129,36 @@ def test_image_starts_ocr_session_and_sends_list(app_module, client, fake_supaba
     assert "Milk" in sent[0]["body"] and "Reply *1*" in sent[0]["body"]
 
 
-def test_image_with_no_items_sends_retry_message(app_module, client, fake_supabase, fake_openai):
+def test_image_empty_ocr_uses_vision_fallback(app_module, client, fake_supabase, fake_openai):
     fake_supabase.seed_whatsapp_config()
-    fake_openai._chat.next_content = "[]"
+    fake_openai._chat.queue = [
+        "[]",
+        "Handwritten note: book jewelry appointment on Tuesday 3pm",
+    ]
 
     r = client.post("/v1/whatsapp/ingest", json=_image_msg(), headers=AUTH)
     assert r.status_code == 200
     body = r.get_json()
     assert body["handled"] is True
     assert body["done"] is False
-    assert body["reason"] == "no_items"
-    assert fake_supabase.ocr_sessions() == []
+    session = fake_supabase.ocr_sessions()[0]
+    assert "Tuesday" in session["items_json"][0]["name"]
+    assert len(app_module._sent_messages) == 1
+    assert "Tuesday" in app_module._sent_messages[0]["body"]
+
+
+def test_voice_uses_full_transcript_when_structured_empty(app_module, client, fake_supabase, fake_openai):
+    """LLM returns [] but Whisper had text — still stay in OCR loop."""
+    fake_supabase.seed_whatsapp_config()
+    fake_openai._audio.next_text = "Book me for Tuesday 3pm for silver jewelry"
+    fake_openai._chat.next_content = "[]"
+
+    r = client.post("/v1/whatsapp/ingest", json=_audio_msg(), headers=AUTH)
+    assert r.status_code == 200
+    assert r.get_json()["handled"] is True
+    session = fake_supabase.ocr_sessions()[0]
+    assert "Tuesday" in session["items_json"][0]["name"]
+    assert "Tuesday" in app_module._sent_messages[0]["body"]
 
 
 # ---------------------------------------------------------------------------

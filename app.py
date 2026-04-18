@@ -6,13 +6,14 @@ Purpose
 A tiny, stateless-looking HTTP service that the n8n ingress workflow calls as a
 "gate" for every inbound WhatsApp message. It:
 
-  1. Handles image/voice inputs (OCR / transcription + list extraction).
+  1. Handles image/voice inputs (OCR / transcription + structuring into lines
+     the user can confirm).
   2. Runs the confirm/edit conversation end-to-end over WhatsApp (direct
-     Graph API sends) until the user is happy.
+     Graph API sends) until the user confirms.
   3. Returns `{done: true, injected_text, resume_mode}` once the user
-     confirms. The n8n workflow then injects that text as a regular user
-     message and resumes its existing routing (order / service / appointment
-     / call) unchanged.
+     confirms. The n8n workflow injects `injected_text` as a normal user
+     message — for any flow (orders, appointments, services, etc.), not only
+     shopping lists.
 
 Design goals
 ------------
@@ -101,6 +102,9 @@ STATE_AWAIT_CONFIRM = "awaiting_confirmation"
 STATE_EDIT_MODE = "edit_mode"
 
 ALLOWED_RESUME_MODES = {"order", "service", "appointment", "calling"}
+
+# Max chars per line in stored JSON (WhatsApp + DB safety).
+_MAX_LINE_CHARS = 3900
 
 
 # ---------------------------------------------------------------------------
@@ -326,12 +330,18 @@ def _parse_items_json(raw: str) -> list[dict]:
 
 
 def _ocr_image_to_items(image_bytes: bytes, mime: str) -> list[dict]:
+    """Extract readable lines from an image (lists, notes, screenshots, etc.)."""
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     prompt = (
-        "This is a photo of a shopping / grocery list. "
-        "Extract every item. Return ONLY a JSON array, no markdown, no explanation.\n"
-        'Each element: {"name": "...", "quantity": "..."}. '
-        "If the quantity is unclear or missing, use an empty string."
+        "Read this image. Extract what the user is communicating as separate "
+        "lines for confirmation before sending to a business assistant.\n"
+        "- Handwritten or printed lists: one product or idea per element.\n"
+        "- Notes, forms, screenshots: split distinct facts onto separate lines.\n"
+        "- If there is one clear message, use a single element.\n"
+        "Use \"quantity\" only when it is a count/weight/size for an order; "
+        "otherwise use an empty string.\n"
+        "Return ONLY a JSON array, no markdown, no explanation.\n"
+        'Each element: {"name": "...", "quantity": "..."}.'
     )
     resp = openai_client.chat.completions.create(
         model=OPENAI_VISION_MODEL,
@@ -353,6 +363,55 @@ def _ocr_image_to_items(image_bytes: bytes, mime: str) -> list[dict]:
     return _parse_items_json(resp.choices[0].message.content or "")
 
 
+def _vision_describe_image(image_bytes: bytes, mime: str) -> str:
+    """Fallback when OCR returns no structured lines — short plain-text summary."""
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = (
+        "In 1–4 short lines, describe what the user is showing or what they "
+        "likely want to communicate. Plain text only — no JSON, no markdown."
+    )
+    resp = openai_client.chat.completions.create(
+        model=OPENAI_VISION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+        max_tokens=400,
+        temperature=0,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _ensure_image_items(
+    items: list[dict], image_bytes: bytes, mime: str
+) -> list[dict]:
+    if items:
+        return items
+    try:
+        desc = _vision_describe_image(image_bytes, mime)
+        if desc:
+            return [{"name": desc[:_MAX_LINE_CHARS], "quantity": ""}]
+    except Exception as e:
+        log.warning("vision describe fallback failed: %s", e)
+    return [
+        {
+            "name": (
+                "(No clear text in this image — reply *2* to edit and type "
+                "what you meant.)"
+            ),
+            "quantity": "",
+        }
+    ]
+
+
 def _transcribe_audio(audio_bytes: bytes, mime: str) -> str:
     ext = (mime.split("/")[-1].split(";")[0] or "ogg").strip()
     buf = io.BytesIO(audio_bytes)
@@ -365,23 +424,24 @@ def _transcribe_audio(audio_bytes: bytes, mime: str) -> str:
     return text
 
 
-def _text_to_items(text: str) -> list[dict]:
+def _transcript_to_structured_items(text: str) -> list[dict]:
+    """Split a voice transcript into lines for confirm/edit (any business context)."""
     prompt = (
-        "You convert a customer's free-form message (often a voice-note "
-        "transcription) into a structured shopping list. The message can be "
-        "in any language; translate item names to English if obvious.\n\n"
+        "You convert a customer's message (usually a voice-note transcript) "
+        "into lines they can confirm before sending to a business assistant. "
+        "The assistant may handle orders, appointments, services, or general "
+        "questions — not only shopping.\n\n"
         "Instructions:\n"
-        "1. Ignore greetings, politeness, filler (\"I need\", \"please send\", "
-        "   \"bhaiya\", \"also\", \"and\", \"okay\", \"bye\", etc.).\n"
-        "2. Extract every product the user wants. Be generous — if the user "
-        "   mentions a grocery / household / store item by name, include it.\n"
-        "3. Quantity can be weight (500g, 1kg), volume (1L), count (2, 3 packs), "
-        "   or empty string if unclear.\n"
-        "4. Return ONLY a JSON array, no markdown, no explanation, no prose.\n"
-        '   Format: [{"name": "Milk", "quantity": "1L"}, '
-        '{"name": "Bread", "quantity": ""}]\n'
-        "5. If truly nothing was asked for, return [].\n\n"
-        f"Message:\n{text}"
+        "1. Preserve meaning. You may trim filler (\"um\", \"please\", \"okay\") "
+        "   but keep names, dates, products, and requests.\n"
+        "2. Put each distinct fact, request, or item on its own line (name field). "
+        "   Examples: appointment time, product interest, address, phone number.\n"
+        "3. Use \"quantity\" only for countable order-style amounts "
+        "   (e.g. 2 kg, 3 packs); otherwise empty string.\n"
+        "4. Return ONLY a JSON array, no markdown, no explanation.\n"
+        '   Format: [{"name": "...", "quantity": "..."}, ...]\n'
+        "5. If the message is one coherent utterance, a single element is fine.\n\n"
+        f"Transcript:\n{text}"
     )
     resp = openai_client.chat.completions.create(
         model=OPENAI_TEXT_MODEL,
@@ -390,9 +450,22 @@ def _text_to_items(text: str) -> list[dict]:
         temperature=0,
     )
     raw = resp.choices[0].message.content or ""
-    items = _parse_items_json(raw)
-    log.info("text_to_items: text=%r -> %d items", text[:200], len(items))
-    return items
+    return _parse_items_json(raw)
+
+
+def _ensure_voice_items(transcript: str, items: list[dict]) -> list[dict]:
+    """Always return at least one line so voice always stays in the OCR loop."""
+    if items:
+        return items
+    t = (transcript or "").strip()
+    if t:
+        return [{"name": t[:_MAX_LINE_CHARS], "quantity": ""}]
+    return [
+        {
+            "name": "(Empty voice note — reply *2* to edit and type your message.)",
+            "quantity": "",
+        }
+    ]
 
 
 def _apply_edits(items: list[dict], edit_text: str) -> list[dict]:
@@ -400,16 +473,17 @@ def _apply_edits(items: list[dict], edit_text: str) -> list[dict]:
         f"{i+1}. {it['name']}"
         + (f" — {it['quantity']}" if it.get("quantity") else "")
         for i, it in enumerate(items)
-    ) or "(list is empty)"
+    ) or "(no lines yet)"
     prompt = (
-        "You are editing a shopping list based on a user instruction.\n\n"
-        f"Current list (numbered for reference):\n{numbered}\n\n"
-        f"Current list as JSON:\n{json.dumps(items, ensure_ascii=False)}\n\n"
-        f"User edit instruction:\n{edit_text}\n\n"
+        "You are editing the user's draft message (numbered lines) based on "
+        "their instruction. This can be orders, appointments, or any request.\n\n"
+        f"Current lines (numbered):\n{numbered}\n\n"
+        f"Current JSON:\n{json.dumps(items, ensure_ascii=False)}\n\n"
+        f"User instruction:\n{edit_text}\n\n"
         "Supported edits:\n"
-        "- add:       'add <name> - <qty>'     -> append a new item\n"
-        "- update:    'update <N> <name> - <qty>' or '<name> - <qty>' -> update or add\n"
-        "- delete:    'delete <N>' or 'remove <name>' -> remove (case-insensitive)\n\n"
+        "- add:       'add <text>' or 'add <name> - <qty>' -> append a line\n"
+        "- update:    'update <N> ...' or replace a line\n"
+        "- delete:    'delete <N>' or 'remove <text>' -> remove (case-insensitive)\n\n"
         "Return ONLY the updated JSON array, no markdown, no explanation.\n"
         'Each element: {"name": "...", "quantity": "..."}.'
     )
@@ -426,33 +500,33 @@ def _apply_edits(items: list[dict], edit_text: str) -> list[dict]:
 # UX strings + helpers
 # ---------------------------------------------------------------------------
 
-def _format_list_message(items: list[dict]) -> str:
+def _format_confirm_message(items: list[dict]) -> str:
     lines = "\n".join(
         f"{i+1}. {it['name']}"
         + (f" — {it['quantity']}" if it.get("quantity") else "")
         for i, it in enumerate(items)
     )
     return (
-        f"🛒 Your list has *{len(items)} item(s)*:\n\n"
+        f"📝 Here's what we'll send (*{len(items)} line(s)*):\n\n"
         f"{lines}\n\n"
-        "Reply *1* to confirm ✅\n"
+        "Reply *1* to confirm and continue ✅\n"
         "Reply *2* to edit ✏️"
     )
 
 
 def _edit_help_message() -> str:
     return (
-        "✏️ *Edit Mode*\n\n"
+        "✏️ *Edit mode*\n\n"
         "Send changes, for example:\n"
-        "• _add Butter - 500g_\n"
-        "• _Sugar - 2kg_\n"
-        "• _remove Milk_  or  _delete 3_\n\n"
+        "• _add Tuesday 3pm_\n"
+        "• _delete 2_\n"
+        "• _remove silver rings_\n\n"
         "Reply *done* when finished."
     )
 
 
 def _items_to_injected_text(items: list[dict]) -> str:
-    """Shape used when we hand the confirmed list back to n8n as a user message."""
+    """Confirmed text passed to n8n as a normal user message."""
     return "\n".join(
         f"{it['name']}" + (f" - {it['quantity']}" if it.get("quantity") else "")
         for it in items
@@ -591,24 +665,22 @@ def ingest():
 
             if message_type == "image":
                 items = _ocr_image_to_items(raw_bytes, mime)
+                items = _ensure_image_items(items, raw_bytes, mime)
                 heading = "📸 Got your photo!"
             else:
                 transcript = _transcribe_audio(raw_bytes, mime)
-                items = _text_to_items(transcript) if transcript else []
+                structured = (
+                    _transcript_to_structured_items(transcript) if transcript else []
+                )
+                items = _ensure_voice_items(transcript, structured)
+                log.info(
+                    "voice: transcript_len=%d -> %d line(s)",
+                    len(transcript or ""),
+                    len(items),
+                )
                 heading = (
                     f"🎙️ I heard: _{transcript}_" if transcript else "🎙️ Got your voice note!"
                 )
-
-            if not items:
-                _send_wa_text(
-                    phone_number_id,
-                    access_token,
-                    from_phone,
-                    "😕 I couldn't find any items in that. "
-                    "Please send a clearer photo, a voice note, or type the list as text.",
-                )
-                # Still "handled" — we responded. Don't let n8n double-reply.
-                return jsonify({"handled": True, "done": False, "reason": "no_items"}), 200
 
             # Carry forward resume_mode if we already had a session, otherwise
             # use the mode n8n told us about for this user.
@@ -630,7 +702,7 @@ def ingest():
                 phone_number_id,
                 access_token,
                 from_phone,
-                f"{heading}\n\n{_format_list_message(items)}",
+                f"{heading}\n\n{_format_confirm_message(items)}",
             )
             return jsonify({"handled": True, "done": False}), 200
 
@@ -650,7 +722,7 @@ def ingest():
                         phone_number_id,
                         access_token,
                         from_phone,
-                        "✅ Confirmed! Placing your items now...",
+                        "✅ Confirmed! Continuing…",
                     )
                     return (
                         jsonify(
@@ -677,7 +749,7 @@ def ingest():
                     )
                     return jsonify({"handled": True, "done": False}), 200
 
-                # Unknown reply -> re-show list.
+                # Unknown reply -> re-show draft.
                 _upsert_session(
                     seller_id,
                     from_phone,
@@ -691,7 +763,7 @@ def ingest():
                     access_token,
                     from_phone,
                     "Please reply *1* to confirm or *2* to edit.\n\n"
-                    + _format_list_message(items),
+                    + _format_confirm_message(items),
                 )
                 return jsonify({"handled": True, "done": False}), 200
 
@@ -706,7 +778,7 @@ def ingest():
                     last_message_id=message_id,
                 )
                 _send_wa_text(
-                    phone_number_id, access_token, from_phone, _format_list_message(items)
+                    phone_number_id, access_token, from_phone, _format_confirm_message(items)
                 )
                 return jsonify({"handled": True, "done": False}), 200
 
@@ -747,8 +819,8 @@ def ingest():
                 phone_number_id,
                 access_token,
                 from_phone,
-                "✅ Updated! Current list:\n\n"
-                + _format_list_message(new_items)
+                "✅ Updated! Current draft:\n\n"
+                + _format_confirm_message(new_items)
                 + "\n\nKeep editing, or reply *done* to confirm.",
             )
             return jsonify({"handled": True, "done": False}), 200
