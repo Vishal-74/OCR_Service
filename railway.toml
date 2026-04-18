@@ -5,8 +5,10 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60"
+# No startCommand here — the Dockerfile's CMD handles start-up via `sh -c`
+# so $PORT gets properly expanded. Setting startCommand here bypasses the
+# shell and Railway passes "$PORT" to gunicorn as a literal string.
 healthcheckPath = "/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
